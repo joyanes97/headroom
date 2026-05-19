@@ -842,7 +842,11 @@ def test_inject_tools_extract_query_and_has_tool_calls(
     assert existing == [{"function": {"name": "memory_save"}}]
 
     assert handler._extract_user_query([{"role": "assistant", "content": "skip"}]) == ""
-    assert handler._extract_user_query([{"role": "user", "content": "x" * 600}]) == "x" * 500
+    # Pre-PR-this method truncated at 500 chars; that was a real bug
+    # (none of Letta / Mem0 / Cognee / Supermemory truncate the
+    # retrieval query). Now returns the full message — embedder
+    # handles its own context window. See ``MemoryQuery``.
+    assert handler._extract_user_query([{"role": "user", "content": "x" * 600}]) == "x" * 600
     assert (
         handler._extract_user_query(
             [{"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "image"}]}]

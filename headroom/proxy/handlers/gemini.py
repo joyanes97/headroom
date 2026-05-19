@@ -5,6 +5,7 @@ Contains all Google Gemini API handlers including format conversion utilities.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -253,6 +254,22 @@ class GeminiHandlerMixin:
                 ),
             )
 
+        # Canonical memory-injection gate (parallels Anthropic + OpenAI).
+        # Pre-PR-this Gemini's memory site silently ignored
+        # `x-headroom-bypass: true`, mutating request bytes under the
+        # user's "don't touch my bytes" signal.
+        from headroom.proxy.helpers import get_memory_injection_mode
+        from headroom.proxy.memory_decision import MemoryDecision
+        from headroom.proxy.memory_query import MemoryQuery
+
+        memory_decision = MemoryDecision.decide(
+            headers=request.headers,
+            memory_handler=self.memory_handler,
+            memory_user_id=memory_user_id,
+            mode_name=get_memory_injection_mode(),
+        )
+        memory_decision.apply_to_tags(tags)
+
         # Rate limiting (use Gemini API key)
         if self.rate_limiter:
             rate_key = headers.get("x-goog-api-key", "default")[:20]
@@ -379,13 +396,28 @@ class GeminiHandlerMixin:
         # the memory handler is in ``MemoryMode.TOOL`` its
         # ``search_and_format_context`` returns ``None`` so nothing flows
         # in here.
-        if self.memory_handler and memory_user_id:
+        if memory_decision.inject:
+            # Memory-handler is guaranteed present when inject=True.
+            # Add a timeout wrapping (matches Anthropic + Responses) so
+            # a slow memory backend can't stall Gemini requests — pre-
+            # PR-this Gemini was the only handler without one.
+            #
+            # The append uses provider="openai" because Gemini reuses
+            # OpenAI's user-message content shape after the proxy's
+            # gemini-contents → messages → gemini-contents round-trip.
+            # That's a real coupling, not a bug — `_append_to_latest_
+            # user_tail` only knows two surface shapes; openai matches
+            # the post-conversion structure exactly.
             try:
                 if self.memory_handler.config.inject_context:
-                    memory_context = await self.memory_handler.search_and_format_context(
-                        memory_user_id,
-                        optimized_messages,
-                        request_context=memory_request_ctx,
+                    memory_context = await asyncio.wait_for(
+                        self.memory_handler.search_and_format_context(
+                            memory_user_id,
+                            optimized_messages,
+                            request_context=memory_request_ctx,
+                            query=MemoryQuery.from_messages(optimized_messages),
+                        ),
+                        timeout=(self.config.anthropic_pre_upstream_memory_context_timeout_seconds),
                     )
                     if memory_context:
                         new_messages, bytes_appended = (

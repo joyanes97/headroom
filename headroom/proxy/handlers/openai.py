@@ -1272,6 +1272,22 @@ class OpenAIHandlerMixin:
                 ),
             )
 
+        # Canonical memory-injection gate (parallels Anthropic). Pre-
+        # PR-this the inline conjunction at the memory site silently
+        # ignored `x-headroom-bypass: true`, mutating request bytes
+        # under the user's "don't touch my bytes" signal.
+        from headroom.proxy.helpers import get_memory_injection_mode
+        from headroom.proxy.memory_decision import MemoryDecision
+        from headroom.proxy.memory_query import MemoryQuery
+
+        memory_decision = MemoryDecision.decide(
+            headers=request.headers,
+            memory_handler=self.memory_handler,
+            memory_user_id=memory_user_id,
+            mode_name=get_memory_injection_mode(),
+        )
+        memory_decision.apply_to_tags(tags)
+
         # Rate limiting
         if self.rate_limiter:
             rate_key = headers.get("authorization", "default")[:20]
@@ -1617,13 +1633,21 @@ class OpenAIHandlerMixin:
         # invariant I2. See REALIGNMENT/03-phase-A-lockdown.md PR-A3.
         memory_context_injected = False
         memory_tools_injected = False
-        if self.memory_handler and memory_user_id:
+        if memory_decision.inject:
+            # Memory-handler is guaranteed present when inject=True.
+            # Timeout-wrap (matches Anthropic /v1/messages and
+            # /v1/responses) — pre-PR-this site was the only chat
+            # path without one.
             try:
                 if self.memory_handler.config.inject_context:
-                    memory_context = await self.memory_handler.search_and_format_context(
-                        memory_user_id,
-                        optimized_messages,
-                        request_context=memory_request_ctx,
+                    memory_context = await asyncio.wait_for(
+                        self.memory_handler.search_and_format_context(
+                            memory_user_id,
+                            optimized_messages,
+                            request_context=memory_request_ctx,
+                            query=MemoryQuery.from_messages(optimized_messages),
+                        ),
+                        timeout=(self.config.anthropic_pre_upstream_memory_context_timeout_seconds),
                     )
                     if memory_context:
                         from headroom.proxy.helpers import (
@@ -2423,8 +2447,26 @@ class OpenAIHandlerMixin:
         transforms_applied: list[str] = []
         optimization_latency = (time.time() - start_time) * 1000
 
-        # Memory: inject context and tools for Responses API requests
-        if self.memory_handler and memory_user_id and not _bypass:
+        # Memory: inject context and tools for Responses API requests.
+        # Gated on MemoryDecision — uniformly respects bypass across all
+        # five injection sites. The Responses path is the only one that
+        # injects BEFORE compression today (sites 1/2/3 inject after);
+        # bringing this into alignment is queued as a follow-up
+        # (FUTURE: move context injection to post-compression for
+        # uniform "memory text rides uncompressed across all
+        # handlers" semantics — separate PR with cache-stability tests).
+        from headroom.proxy.helpers import get_memory_injection_mode
+        from headroom.proxy.memory_decision import MemoryDecision
+        from headroom.proxy.memory_query import MemoryQuery
+
+        responses_memory_decision = MemoryDecision.decide(
+            headers=request.headers,
+            memory_handler=self.memory_handler,
+            memory_user_id=memory_user_id,
+            mode_name=get_memory_injection_mode(),
+        )
+        responses_memory_decision.apply_to_tags(tags)
+        if responses_memory_decision.inject:
             try:
                 # Memory context now routes exclusively to the live-zone tail
                 # (latest non-frozen user item). Instructions are part of the
@@ -2437,6 +2479,7 @@ class OpenAIHandlerMixin:
                                 memory_user_id,
                                 optimized_messages,
                                 request_context=memory_request_ctx,
+                                query=MemoryQuery.from_messages(optimized_messages),
                             ),
                             timeout=RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS,
                         )
@@ -3394,13 +3437,35 @@ class OpenAIHandlerMixin:
                 )
 
             # --- Memory: inject context, tools, and instructions ---
+            # Gated on MemoryDecision — uniform bypass-respect across
+            # all five sites. WS sets memory_user_id only on the inject
+            # path (matches pre-PR behaviour); MemoryDecision is the
+            # canonical gate.
             memory_user_id: str | None = None
             memory_request_ctx = None
-            if self.memory_handler and body and not _ws_bypass:
-                memory_user_id = ws_headers.get(
+            if self.memory_handler and body:
+                _ws_memory_user_id_candidate = ws_headers.get(
                     "x-headroom-user-id",
                     os.environ.get("USER", os.environ.get("USERNAME", "default")),
                 )
+            else:
+                _ws_memory_user_id_candidate = None
+            from headroom.proxy.helpers import get_memory_injection_mode
+            from headroom.proxy.memory_decision import MemoryDecision
+            from headroom.proxy.memory_query import MemoryQuery
+
+            ws_memory_decision = MemoryDecision.decide(
+                headers=ws_headers,
+                memory_handler=self.memory_handler if body else None,
+                memory_user_id=_ws_memory_user_id_candidate,
+                mode_name=get_memory_injection_mode(),
+            )
+            # ws_tags was extracted at handler entry (L3028); applying
+            # the memory skip reason here so per-turn RequestOutcomes
+            # carry it for dashboard slicing.
+            ws_memory_decision.apply_to_tags(ws_tags)
+            if ws_memory_decision.inject:
+                memory_user_id = _ws_memory_user_id_candidate
                 try:
                     # Unwrap response.create envelope to access the response body
                     ws_response_body = body.get("response", body)
@@ -3456,6 +3521,7 @@ class OpenAIHandlerMixin:
                                         memory_user_id,
                                         ws_msgs,
                                         request_context=memory_request_ctx,
+                                        query=MemoryQuery.from_messages(ws_msgs),
                                     ),
                                     timeout=RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS,
                                 )
@@ -3467,15 +3533,38 @@ class OpenAIHandlerMixin:
                                 f"continuing without it"
                             )
                         if memory_context:
-                            existing = ws_response_body.get("instructions") or ""
-                            if existing:
-                                ws_response_body["instructions"] = f"{existing}\n\n{memory_context}"
+                            # Route memory into ws_response_body["input"]
+                            # (the user-input field) rather than
+                            # ws_response_body["instructions"] (the
+                            # system/cache-hot-zone field). All other
+                            # handlers inject at the user-message tail
+                            # so the cache prefix bytes stay byte-
+                            # stable across turns — invariant I2. The
+                            # WS path was the lone outlier writing to
+                            # instructions (system); fixed here for
+                            # uniformity with sites 1/2/3/4.
+                            ws_input_for_inject = ws_response_body.get("input", "")
+                            if isinstance(ws_input_for_inject, str):
+                                if ws_input_for_inject:
+                                    ws_response_body["input"] = (
+                                        ws_input_for_inject + "\n\n" + memory_context
+                                    )
+                                else:
+                                    ws_response_body["input"] = memory_context
+                                logger.info(
+                                    f"[{request_id}] WS Memory: Injected {len(memory_context)} chars "
+                                    f"into input tail (string-shaped input)"
+                                )
                             else:
-                                ws_response_body["instructions"] = memory_context
-                            logger.info(
-                                f"[{request_id}] WS Memory: Injected {len(memory_context)} chars "
-                                f"of context into instructions"
-                            )
+                                # List-shaped WS input is owned by the
+                                # Rust handler (per PR-C5 comment). The
+                                # Python path leaves memory un-injected
+                                # for list inputs rather than touching
+                                # instructions.
+                                logger.info(
+                                    f"[{request_id}] WS Memory: list-shaped input — "
+                                    f"injection deferred to Rust handler"
+                                )
 
                     # Inject memory tools (Responses API format) — PR-A7 (P0-6).
                     # WS path uses a per-connection UUID; tracker scope is
