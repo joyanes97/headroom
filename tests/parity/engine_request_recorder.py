@@ -61,10 +61,15 @@ from fastapi.testclient import TestClient  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Fixture location
+# Fixture locations
 # ---------------------------------------------------------------------------
 
 _FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures" / "engine_request_golden"
+# Separate directory for CCR-ON fixtures so load_all_golden_fixtures (which
+# scans _FIXTURES_ROOT) does not pick them up and feed them to the non-CCR
+# parity test (test_engine_request_parity.py), which would fail because the
+# non-CCR engine does not inject CCR tools.
+_CCR_FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures" / "ccr_request_golden"
 
 
 # ---------------------------------------------------------------------------
@@ -963,15 +968,204 @@ def seed_all_golden_fixtures(
     return results
 
 
+# ---------------------------------------------------------------------------
+# CCR corpus — deterministic CCR-ON golden cases (Chunk 4.2b)
+#
+# These fixtures use ccr_inject_tool=True and/or ccr_inject_system_instructions=True.
+# To make the marker scan deterministic without running actual compression,
+# the body contains a pre-formed CCR marker (exact 24-hex hash) in a
+# tool_result — scan_for_markers detects it and the tool/system injection fires.
+#
+# Proactive expansion is excluded from this corpus (ccr_proactive_expansion=False)
+# because analyze_query is ML-nondeterministic; that behaviour is covered by
+# structural (mock-based) tests in tests/engine/test_facade_ccr.py.
+# ---------------------------------------------------------------------------
+
+# A valid 24-character hex hash that scan_for_markers will detect.
+_CCR_TEST_HASH = "abcdef123456789012345678"
+# A CCR marker in the exact format scan_for_markers recognises.
+_CCR_MARKER = f"[100 items compressed to 10. Retrieve more: hash={_CCR_TEST_HASH}]"
+
+_CCR_CORPUS: list[GoldenCaseSpec] = [
+    # ── CCR-1. tool injection fires (frozen=0) ────────────────────────────────
+    # Body has a CCR marker in a tool_result + no existing tools → handler
+    # injects the headroom_retrieve tool. frozen=0 so tool injection is allowed.
+    # No system message → system instructions are injected (ccr_inject_system_instructions=True).
+    GoldenCaseSpec(
+        name="ccr_tool_inject_frozen0",
+        inbound_headers=_STANDARD_HEADERS,
+        body={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 128,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_search_01",
+                            "name": "search_files",
+                            "input": {"pattern": "*.py"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_search_01",
+                            "content": f"Found 100 Python files. {_CCR_MARKER}",
+                        }
+                    ],
+                },
+            ],
+        },
+        proxy_config={
+            "optimize": True,
+            "mode": "token",
+            "ccr_inject_tool": True,
+            "ccr_inject_system_instructions": True,
+            "ccr_handle_responses": False,
+            "ccr_context_tracking": False,
+        },
+        frozen_count=0,
+        notes=(
+            "CCR-ON; frozen=0; body contains a CCR marker in tool_result; "
+            "handler injects headroom_retrieve tool + system instructions; "
+            "byte-exact because tool injection is deterministic"
+        ),
+    ),
+    # ── CCR-2. frozen prefix in cache mode — tool injection suppressed ────────
+    # In cache mode with frozen_count=2, _strict_previous_turn_frozen_count raises
+    # the frozen count further. In token mode, _FreshCompressionCache.compute_frozen_count
+    # returns 0, which clamps frozen_count to min(2,0)=0 — so frozen guard never fires.
+    # Use cache mode to actually exercise frozen suppression of system instructions.
+    GoldenCaseSpec(
+        name="ccr_tool_inject_frozen_suppressed",
+        inbound_headers=_STANDARD_HEADERS,
+        body={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 128,
+            "messages": [
+                {"role": "user", "content": "Frozen turn 1 (cache hot zone)"},
+                {"role": "assistant", "content": "Reply to frozen turn 1"},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_search_02",
+                            "content": f"Results compressed. {_CCR_MARKER}",
+                        }
+                    ],
+                },
+            ],
+        },
+        proxy_config={
+            "optimize": True,
+            "mode": "cache",
+            "ccr_inject_tool": True,
+            "ccr_inject_system_instructions": True,
+            "ccr_handle_responses": False,
+            "ccr_context_tracking": False,
+        },
+        frozen_count=2,
+        notes=(
+            "CCR-ON; cache mode; frozen_count=2; _strict_previous_turn_frozen_count pushes "
+            "frozen_message_count to max(2,2)=2 (final turn is user → idx=2); "
+            "inject_tool and inject_system_instructions are both suppressed by the frozen gate; "
+            "body has CCR marker but neither tool nor system-instruction is injected; "
+            "byte-exact — deterministic"
+        ),
+    ),
+    # ── CCR-3. tool injection only (system instructions disabled) ─────────────
+    # ccr_inject_system_instructions=False → only tool injection fires.
+    # Existing tools=[] in body (no pre-existing tools).
+    GoldenCaseSpec(
+        name="ccr_tool_inject_no_system_instr",
+        inbound_headers=_STANDARD_HEADERS,
+        body={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 128,
+            "tools": [],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_search_03",
+                            "content": f"Compressed output. {_CCR_MARKER}",
+                        }
+                    ],
+                },
+            ],
+        },
+        proxy_config={
+            "optimize": True,
+            "mode": "token",
+            "ccr_inject_tool": True,
+            "ccr_inject_system_instructions": False,
+            "ccr_handle_responses": False,
+            "ccr_context_tracking": False,
+        },
+        frozen_count=0,
+        notes=(
+            "CCR-ON; ccr_inject_system_instructions=False; "
+            "tool injection fires but no system-instruction block is prepended; "
+            "byte-exact"
+        ),
+    ),
+]
+
+
+def seed_ccr_golden_fixtures(
+    *,
+    root: Path | None = None,
+    overwrite: bool = False,
+) -> dict[str, Path]:
+    """Record all CCR corpus cases and return {name: path}.
+
+    Separate from ``seed_all_golden_fixtures`` so the CCR-ON cases can be
+    recorded with ccr_inject_tool/ccr_inject_system_instructions enabled
+    without touching the 18-case baseline corpus.
+
+    CCR fixtures are written to ``_CCR_FIXTURES_ROOT`` (a sibling of
+    ``_FIXTURES_ROOT``) so that ``load_all_golden_fixtures`` (which scans
+    ``_FIXTURES_ROOT``) never picks them up and passes them to the non-CCR
+    parity test, which would fail since the non-CCR engine does not inject tools.
+    """
+    ccr_root = root or _CCR_FIXTURES_ROOT
+    results: dict[str, Path] = {}
+    for spec in _CCR_CORPUS:
+        path = record_golden_fixture(spec, root=ccr_root, overwrite=overwrite)
+        results[spec.name] = path
+    return results
+
+
+def load_ccr_golden_fixtures(root: Path | None = None) -> list[GoldenFixture]:
+    """Load all CCR golden fixtures from ``_CCR_FIXTURES_ROOT``."""
+    fixture_dir = root or _CCR_FIXTURES_ROOT
+    paths = sorted(fixture_dir.glob("*.json"))
+    return [load_golden_fixture(p) for p in paths]
+
+
 __all__ = [
     "GoldenCaseSpec",
     "GoldenFixture",
     "_CORPUS",
+    "_CCR_CORPUS",
+    "_CCR_TEST_HASH",
+    "_CCR_MARKER",
     "_FIXTURES_ROOT",
+    "_CCR_FIXTURES_ROOT",
     "DEFERRED_CASES",
     "load_all_golden_fixtures",
+    "load_ccr_golden_fixtures",
     "load_golden_fixture",
     "record_golden_fixture",
     "replay_golden_fixture",
     "seed_all_golden_fixtures",
+    "seed_ccr_golden_fixtures",
 ]

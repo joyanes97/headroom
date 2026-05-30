@@ -1,4 +1,4 @@
-"""HeadroomEngine — request/response hook facade (Chunk 2 + 4.2a).
+"""HeadroomEngine — request/response hook facade (Chunk 2 + 4.2a/4.2b).
 
 Composes the existing compression subsystems behind a clean hook interface.
 Does NOT reimplement compression; delegates to injected ``CompressionPipeline``
@@ -15,14 +15,20 @@ Design notes
 - **Chunk 4.2a — real Anthropic path**: when ``anthropic_components`` is
   provided the engine orchestrates the full handler compression-core (mode
   branching, frozen-count, tool-sort, prepare_outbound_body_bytes) using the
-  SAME callables the handler uses. CCR-tool-injection, memory injection, and
-  proactive-expansion are excluded (Chunks 4.2b/4.2c).
+  SAME callables the handler uses.
+- **Chunk 4.2b — CCR request-side**: when ``ccr_components`` is additionally
+  provided, the engine runs the full CCR request-side pipeline (workspace
+  resolution, marker scan + session-sticky tool injection, compression tracking,
+  proactive expansion) AFTER compression-core, using the SAME callables the
+  handler uses. Memory injection (4.2c) runs between compression tracking and
+  proactive expansion — the ordering seam is clearly marked.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -38,6 +44,8 @@ from headroom.engine.ports import CompressionPipeline
 from headroom.proxy.auth_mode import classify_auth_mode
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.transforms.compression_policy import resolve_policy
+
+logger = logging.getLogger("headroom.engine")
 
 
 class AnthropicComponents:
@@ -83,6 +91,47 @@ class AnthropicComponents:
         self.usage_reporter = usage_reporter
 
 
+class CCRComponents:
+    """Injectable CCR request-side components for the engine (Chunk 4.2b).
+
+    When this is provided to ``HeadroomEngine``, the engine runs the full
+    CCR request-side pipeline after compression-core. When ``None``, the
+    CCR steps are skipped entirely (no-op), which preserves byte-identical
+    output for all existing CCR-OFF fixtures.
+
+    Parameters
+    ----------
+    ccr_context_tracker:
+        Live ``CCRContextTracker`` instance, or ``None`` when CCR context
+        tracking is disabled. When ``None``, compression-tracking and
+        proactive-expansion steps are skipped.
+    get_compression_store:
+        Callable ``() -> CompressionStore`` — returns the store used for
+        ``get_metadata(hash_key)`` lookups during compression tracking.
+        Injected so tests can supply a stub store without touching the global.
+    turn_counter:
+        Mutable single-element list ``[int]`` used to share the turn counter
+        across CCR steps. The engine increments ``turn_counter[0]`` when
+        compression tracking fires. Callers pass ``[0]`` on first use;
+        the engine mutates in place so the counter accumulates across turns
+        within the same session (same behaviour as ``self._turn_counter``
+        on the proxy handler). Pass a new ``[0]`` per engine instance.
+    """
+
+    def __init__(
+        self,
+        *,
+        ccr_context_tracker: Any | None,
+        get_compression_store: Callable[[], Any],
+        turn_counter: list[int],
+    ) -> None:
+        self.ccr_context_tracker = ccr_context_tracker
+        self.get_compression_store = get_compression_store
+        # Mutable single-element list so tests/callers can inspect the count
+        # after engine invocations. The engine mutates turn_counter[0] in place.
+        self.turn_counter = turn_counter
+
+
 class HeadroomEngine:
     """Facade that composes Headroom compression behind hook-shaped entry points.
 
@@ -93,12 +142,13 @@ class HeadroomEngine:
     (non-mode-branching) pipeline call. Existing Chunk 2 tests continue to pass
     because this path is unchanged.
 
-    **Real-Anthropic mode** (Chunk 4.2a): ``anthropic_components`` is set.
+    **Real-Anthropic mode** (Chunk 4.2a/4.2b): ``anthropic_components`` is set.
     The engine owns the full compression-core orchestration for Anthropic
     requests: mode-branching (token/non-cache/cache-delta), frozen-count
     derivation, tool-sort, and ``prepare_outbound_body_bytes``. It faithfully
     reproduces what ``AnthropicHandlerMixin.handle_messages`` does for
-    compression-core (excludes CCR injection / memory / proactive-expansion).
+    compression-core. When ``ccr_components`` is also provided, the CCR
+    request-side pipeline (steps 1-4) runs after compression-core.
 
     Parameters
     ----------
@@ -118,6 +168,10 @@ class HeadroomEngine:
         When set, the engine uses the real Anthropic orchestration path for
         Anthropic/Messages requests (Chunk 4.2a). When None, falls back to
         the fake-pipeline path (Chunks 1-2 behaviour).
+    ccr_components:
+        When set (and anthropic_components is also set), the engine runs the
+        full CCR request-side pipeline after compression-core (Chunk 4.2b).
+        When None, CCR steps are a no-op — existing CCR-OFF tests are unchanged.
     """
 
     def __init__(
@@ -128,12 +182,14 @@ class HeadroomEngine:
         usage_reporter: Any | None,
         salt: bytes,
         anthropic_components: AnthropicComponents | None = None,
+        ccr_components: CCRComponents | None = None,
     ) -> None:
         self._pipelines = dict(pipelines)
         self._config = config
         self._usage_reporter = usage_reporter
         self._salt = salt
         self._anthropic_components = anthropic_components
+        self._ccr_components = ccr_components
 
     # ── Request hook ──────────────────────────────────────────────────────────
 
@@ -152,7 +208,7 @@ class HeadroomEngine:
         ValueError
             If the raw body cannot be parsed as JSON (malformed request).
         """
-        # Real Anthropic path (Chunk 4.2a)
+        # Real Anthropic path (Chunk 4.2a + 4.2b)
         if (
             ctx.provider == Provider.ANTHROPIC
             and ctx.flavor == Flavor.MESSAGES
@@ -170,17 +226,28 @@ class HeadroomEngine:
 
         return self._on_request_fake_pipeline(ctx, self._pipelines[key])
 
-    # ── Real Anthropic orchestration (Chunk 4.2a) ─────────────────────────────
+    # ── Real Anthropic orchestration (Chunk 4.2a + 4.2b) ─────────────────────
 
     def _on_request_anthropic_real(self, ctx: RequestContext) -> RequestDecision:
-        """Reproduce the handler's compression-core path byte-for-byte.
+        """Reproduce the handler's compression-core + CCR request-side path.
 
-        Mirrors ``AnthropicHandlerMixin.handle_messages`` compression-core:
-        image compress → CompressionDecision → mode-branch pipeline.apply →
-        tool-sort → prepare_outbound_body_bytes.
+        Mirrors ``AnthropicHandlerMixin.handle_messages`` through:
+          image compress → CompressionDecision → mode-branch pipeline.apply →
+          tool-sort → [CCR: workspace-resolve, marker-scan, tool-inject,
+          system-instruction-inject, compression-tracking, proactive-expansion]
+          → prepare_outbound_body_bytes.
 
-        Excluded (4.2b/4.2c): CCR tool injection, memory injection, proactive
-        expansion, pipeline extension events, security scan, hooks.
+        CCR steps are a no-op when ``self._ccr_components`` is None (all
+        existing CCR-OFF fixtures remain byte-identical).
+
+        Ordering seam for 4.2c (memory injection):
+            Memory injection runs AFTER compression tracking (step 3) and
+            BEFORE proactive expansion (step 4). The comment marked
+            ``# ── 4.2c SEAM: memory injection goes here ──`` is the exact
+            insertion point. Do NOT move step 4 above that comment.
+
+        Excluded from this chunk: hooks, pipeline_extension events, security
+        scan, traffic_learner, memory injection (4.2c).
         """
         from headroom.cache.compression_cache import CompressionCache  # noqa: F401
         from headroom.proxy.helpers import (
@@ -364,6 +431,186 @@ class HeadroomEngine:
             if sorted_tools != tools:
                 body_mutation_tracker.mark_mutated("tool_sort")
             body["tools"] = sorted_tools
+            tools = body["tools"]  # keep local alias in sync
+
+        # ── CCR request-side (Chunk 4.2b) ────────────────────────────────────
+        # Steps 1-4 are a no-op when ccr_components is None or CCR config flags
+        # are off, preserving byte-identical output for all existing CCR-OFF
+        # fixtures.
+        ccr_tool_injected = False
+        ccr_workspace_key = ""
+        ccr_workspace_label: str | None = None
+
+        ccr = self._ccr_components
+        if ccr is not None and not _bypass:
+            # Step 1: workspace resolution ────────────────────────────────────
+            # Adapted from AnthropicHandlerMixin._resolve_ccr_workspace to work
+            # from (headers_view, body) instead of a FastAPI Request object.
+            # Fail-closed: ("", None) → skip CCR tracking + expansion.
+            ccr_workspace_key, ccr_workspace_label = _resolve_ccr_workspace(ctx.headers_view, body)
+
+            # Step 2: marker scan + session-sticky tool injection ─────────────
+            # Gated on the same config flags as the handler.
+            if ac.config.ccr_inject_tool or ac.config.ccr_inject_system_instructions:
+                from headroom.ccr import CCRToolInjector
+                from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+
+                inject_system_instructions = ac.config.ccr_inject_system_instructions
+                if inject_system_instructions and frozen_message_count > 0:
+                    # Cache hot zone — skip to preserve prefix cache bytes.
+                    logger.info(
+                        "[%s] CCR(engine): skipping system instruction injection "
+                        "(frozen prefix=%d) to preserve cache",
+                        request_id,
+                        frozen_message_count,
+                    )
+                    inject_system_instructions = False
+
+                inject_tool = ac.config.ccr_inject_tool
+                if inject_tool and frozen_message_count > 0:
+                    logger.info(
+                        "[%s] CCR(engine): deferring tool injection "
+                        "(frozen prefix=%d) to preserve cache",
+                        request_id,
+                        frozen_message_count,
+                    )
+                    inject_tool = False
+
+                # Scan for compression markers; always with inject_tool=False
+                # because tool-list injection goes through the sticky helper.
+                injector = CCRToolInjector(
+                    provider="anthropic",
+                    inject_tool=False,
+                    inject_system_instructions=inject_system_instructions,
+                )
+                injector.scan_for_markers(optimized_messages)
+
+                # System-instruction injection: only when frozen==0 and compressed.
+                if inject_system_instructions and injector.has_compressed_content:
+                    optimized_messages = injector.inject_into_system_message(optimized_messages)
+                    body_mutation_tracker.mark_mutated("ccr_system_instruction_inject")
+
+                # Sticky-on tool registration (PR-B7): once a session has done CCR
+                # the retrieve tool stays in body["tools"] every turn.
+                if inject_tool:
+                    tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
+                        provider="anthropic",
+                        session_id=session_id,
+                        request_id=request_id,
+                        existing_tools=tools,
+                        has_compressed_content_this_turn=injector.has_compressed_content,
+                    )
+                    if ccr_tool_injected:
+                        body["tools"] = tools
+                        body_mutation_tracker.mark_mutated("ccr_tool_inject")
+                        logger.debug(
+                            "[%s] CCR(engine): tool registered (session=%s, "
+                            "compressed_this_turn=%s, hashes_seen=%d)",
+                            request_id,
+                            session_id,
+                            injector.has_compressed_content,
+                            len(injector.detected_hashes),
+                        )
+
+                # Step 3: compression tracking ────────────────────────────────
+                # Gated on: has_compressed_content AND ccr_context_tracker AND
+                # workspace_key resolved. Fail-closed when workspace is empty —
+                # tracked under empty key would be un-matchable in analyze_query.
+                if injector.has_compressed_content:
+                    if ccr.ccr_context_tracker and ccr_workspace_key:
+                        ccr.turn_counter[0] += 1
+                        for hash_key in injector.detected_hashes:
+                            store = ccr.get_compression_store()
+                            entry = store.get_metadata(hash_key)
+                            if entry:
+                                ccr.ccr_context_tracker.track_compression(
+                                    hash_key=hash_key,
+                                    turn_number=ccr.turn_counter[0],
+                                    tool_name=entry.get("tool_name"),
+                                    original_count=entry.get("original_item_count", 0),
+                                    compressed_count=entry.get("compressed_item_count", 0),
+                                    workspace_key=ccr_workspace_key,
+                                    query_context=entry.get("query_context", ""),
+                                    sample_content=entry.get("compressed_content", "")[:500],
+                                )
+                    elif ccr.ccr_context_tracker and not ccr_workspace_key:
+                        # Explicit fail-closed log — not a silent skip.
+                        logger.info(
+                            "[%s] CCR(engine): workspace unresolved; skipping "
+                            "track_compression (fail-closed — no x-headroom-cwd / "
+                            "x-headroom-project-id header and no cwd: in system prompt)",
+                            request_id,
+                        )
+
+        # ── 4.2c SEAM: memory injection goes here ────────────────────────────
+        # Memory injection (Chunk 4.2c) must run AFTER compression tracking
+        # (step 3 above) and BEFORE proactive expansion (step 4 below).
+        # Insert the memory injection call at this exact location. The
+        # injected context should be appended to the latest non-frozen user
+        # turn via AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn.
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Step 4: proactive expansion ─────────────────────────────────────────
+        # ORDERING NOTE: In the full handler this runs AFTER memory injection.
+        # The 4.2c memory seam above is the canonical insertion point.
+        # Gated on the same workspace and config flags as the handler.
+        if (
+            ccr is not None
+            and not _bypass
+            and ccr.ccr_context_tracker is not None
+            and ac.config.ccr_proactive_expansion
+            and ccr_workspace_key
+        ):
+            from headroom.proxy.modes import is_cache_mode as _is_cache_mode
+
+            # Extract user query from messages (same loop as handler lines ~1340-1351).
+            user_query = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        user_query = content
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                user_query = block.get("text", "")
+                                break
+                    break
+
+            if user_query:
+                recommendations = ccr.ccr_context_tracker.analyze_query(
+                    user_query,
+                    ccr.turn_counter[0],
+                    workspace_key=ccr_workspace_key,
+                )
+                if recommendations:
+                    expansions = ccr.ccr_context_tracker.execute_expansions(recommendations)
+                    if expansions:
+                        expansion_text = ccr.ccr_context_tracker.format_expansions_for_context(
+                            expansions,
+                            workspace_label=ccr_workspace_label,
+                        )
+                        logger.info(
+                            "[%s] CCR(engine): proactively expanded %d context(s) "
+                            "based on query relevance",
+                            request_id,
+                            len(expansions),
+                        )
+                        if _is_cache_mode(ac.config.mode):
+                            logger.info(
+                                "[%s] CCR(engine): skipping proactive expansion append "
+                                "in cache mode to preserve next-turn prefix stability",
+                                request_id,
+                            )
+                        else:
+                            from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+
+                            optimized_messages = AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
+                                optimized_messages,
+                                expansion_text,
+                                frozen_message_count=frozen_message_count,
+                            )
+                            body_mutation_tracker.mark_mutated("ccr_proactive_expansion")
 
         # --- Reassemble body ---
         body["messages"] = optimized_messages
@@ -392,7 +639,7 @@ class HeadroomEngine:
             telemetry=ResponseTelemetry(
                 bytes_saved=bytes_saved,
                 compressed=compressed,
-                ccr_fired=False,
+                ccr_fired=ccr_tool_injected,
             ),
         )
 
@@ -494,6 +741,55 @@ class HeadroomEngine:
 
 
 # ── Private helpers (mirrors static methods on AnthropicHandlerMixin) ─────────
+
+
+def _resolve_ccr_workspace(
+    headers_view: Mapping[str, str],
+    body: dict[str, Any],
+) -> tuple[str, str | None]:
+    """Resolve (workspace_key, workspace_label) for CCR scoping.
+
+    Adapted from ``AnthropicHandlerMixin._resolve_ccr_workspace`` to work
+    from ``(headers_view, body)`` instead of a FastAPI ``Request`` object.
+    The engine has no FastAPI request; all header/body signals are available
+    through ``ctx.headers_view`` and the parsed ``body`` dict respectively.
+
+    Tier order is identical to the handler:
+      x-headroom-project-id → x-headroom-cwd → CLI override (N/A here,
+      project_root_override=None) → cwd: line in system prompt.
+
+    Returns ``("", None)`` on any failure — fail-closed, not silent.
+    A warning is logged so the absence is observable.
+    """
+    from headroom.memory.storage_router import (
+        ProjectResolver,
+    )
+    from headroom.memory.storage_router import (
+        RequestContext as _StorageCtx,
+    )
+    from headroom.memory.storage_router import (
+        extract_system_prompt as _extract_sys_prompt,
+    )
+
+    try:
+        storage_ctx = _StorageCtx(
+            headers=dict(headers_view),
+            system_prompt=_extract_sys_prompt(body),
+            base_user_id=dict(headers_view).get("x-headroom-user-id", ""),
+            project_root_override=None,
+        )
+        ident = ProjectResolver().resolve(storage_ctx)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "event=ccr_workspace_resolve_failed error=%s; "
+            "CCR proactive expansion disabled for this request",
+            exc,
+        )
+        return "", None
+
+    if ident is None:
+        return "", None
+    return ident[0], ident[1]
 
 
 def _strict_previous_turn_frozen_count(
