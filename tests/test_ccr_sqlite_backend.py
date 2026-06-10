@@ -7,6 +7,8 @@ worker processes — neither holds for the in-memory dict.
 
 from __future__ import annotations
 
+import os
+import sqlite3
 import time
 
 import pytest
@@ -125,6 +127,71 @@ class TestSQLiteBackend:
         got = reopened.get("h1")
         assert got is not None
         assert got.retrieval_count == 1
+
+
+class TestMultiWorkerSafety:
+    def test_busy_error_does_not_delete_database(self, db_path):
+        """SQLITE_BUSY (OperationalError, a DatabaseError subclass) under
+        multi-worker write contention must be treated as transient — NOT
+        as corruption that deletes every stored original."""
+        b = SQLiteBackend(db_path)
+        b.set("h1", make_entry())
+
+        class BusyOnceConn:
+            """Delegating wrapper; first SELECT raises 'database is locked'."""
+
+            def __init__(self, real):
+                self._real = real
+                self.raised = False
+
+            def execute(self, *args, **kwargs):
+                if not self.raised and args and "SELECT" in args[0]:
+                    self.raised = True
+                    raise sqlite3.OperationalError("database is locked")
+                return self._real.execute(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real = b._conn
+        b._conn = BusyOnceConn(real)  # type: ignore[assignment]
+        assert b.get("h1") is None  # transient miss, not a crash
+
+        b._conn = real
+        # The data and the database file both survived.
+        assert db_path.exists()
+        assert b.get("h1") is not None
+
+    def test_corruption_message_triggers_reset(self, db_path):
+        b = SQLiteBackend(db_path)
+        b.set("h1", make_entry())
+        b._handle_db_error(sqlite3.DatabaseError("database disk image is malformed"), "get")
+        # Database recreated: empty but functional.
+        assert b.count() == 0
+        b.set("h2", make_entry("h2"))
+        assert b.exists("h2")
+
+    def test_busy_timeout_configured(self, db_path):
+        b = SQLiteBackend(db_path)
+        timeout = b._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert timeout >= 5000
+
+    def test_expired_rows_purged_on_open(self, db_path):
+        b = SQLiteBackend(db_path)
+        expired = make_entry(ttl=1)
+        expired.created_at = time.time() - 10
+        b.set("old", expired)
+        b.set("fresh", make_entry("fresh"))
+
+        reopened = SQLiteBackend(db_path)
+        assert not reopened.exists("old")  # swept at open
+        assert reopened.exists("fresh")
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permissions")
+    def test_database_file_is_private(self, db_path):
+        SQLiteBackend(db_path)
+        mode = db_path.stat().st_mode & 0o777
+        assert mode == 0o600
 
 
 class TestDefaults:

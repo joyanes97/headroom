@@ -78,16 +78,53 @@ class SQLiteBackend:
 
     def _open(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path, check_same_thread=False)
+        # Wait for competing writers instead of failing with SQLITE_BUSY —
+        # multiple proxy workers share this file, and writes are frequent
+        # but tiny, so contention resolves in milliseconds.
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SCHEMA)
+        # Startup hygiene: expired rows are only purged opportunistically
+        # on writes, so a quiet store could otherwise hold expired
+        # originals (which may contain sensitive tool output) on disk
+        # indefinitely. Sweep them on every open.
+        conn.execute(
+            "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
+            (time.time(),),
+        )
         conn.commit()
+        # Originals can contain sensitive tool output (file contents,
+        # command output) — keep the database private to the user.
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(self._path) + suffix)
+            if p.exists():
+                try:
+                    p.chmod(0o600)
+                except OSError:
+                    pass
         return conn
 
-    def _reset_corrupt_db(self, error: Exception) -> None:
-        """Recreate the database after corruption. Loud by design: the
-        cache contents are expendable, silently degrading to a different
-        backend type is not."""
+    @staticmethod
+    def _is_corruption(error: Exception) -> bool:
+        """Only genuine file corruption justifies recreating the database.
+
+        ``sqlite3.OperationalError`` (a DatabaseError subclass) also covers
+        transient conditions like ``database is locked`` under multi-worker
+        write contention — misclassifying those as corruption would delete
+        live data while sibling workers still hold handles to the unlinked
+        inode (split-brain). Match the corruption messages explicitly.
+        """
+        msg = str(error).lower()
+        return "malformed" in msg or "not a database" in msg
+
+    def _handle_db_error(self, error: sqlite3.DatabaseError, op: str) -> None:
+        """Corruption → recreate (loud). Anything else (busy/locked/io) →
+        log and treat the operation as a miss; never destroy data over a
+        transient error."""
+        if not self._is_corruption(error):
+            logger.warning("CCR SQLite %s failed (transient, no reset): %s", op, error)
+            return
         logger.warning(
             "CCR SQLite store at %s is corrupt (%s); recreating. "
             "Previously stored originals are lost — affected retrieval "
@@ -132,7 +169,7 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._reset_corrupt_db(e)
+                self._handle_db_error(e, "get")
                 return None
         if row is None:
             return None
@@ -150,7 +187,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 self._maybe_purge()
             except sqlite3.DatabaseError as e:
-                self._reset_corrupt_db(e)
+                self._handle_db_error(e, "set")
 
     def delete(self, hash_key: str) -> bool:
         with self._lock:
@@ -162,7 +199,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 return cur.rowcount > 0
             except sqlite3.DatabaseError as e:
-                self._reset_corrupt_db(e)
+                self._handle_db_error(e, "op")
                 return False
 
     def exists(self, hash_key: str) -> bool:
@@ -173,7 +210,7 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._reset_corrupt_db(e)
+                self._handle_db_error(e, "op")
                 return False
         return row is not None
 
@@ -183,14 +220,14 @@ class SQLiteBackend:
                 self._conn.execute("DELETE FROM ccr_entries")
                 self._conn.commit()
             except sqlite3.DatabaseError as e:
-                self._reset_corrupt_db(e)
+                self._handle_db_error(e, "op")
 
     def count(self) -> int:
         with self._lock:
             try:
                 row = self._conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()
             except sqlite3.DatabaseError as e:
-                self._reset_corrupt_db(e)
+                self._handle_db_error(e, "op")
                 return 0
         return int(row[0])
 
@@ -199,7 +236,7 @@ class SQLiteBackend:
             try:
                 rows = self._conn.execute("SELECT hash FROM ccr_entries").fetchall()
             except sqlite3.DatabaseError as e:
-                self._reset_corrupt_db(e)
+                self._handle_db_error(e, "op")
                 return []
         return [r[0] for r in rows]
 
@@ -208,7 +245,7 @@ class SQLiteBackend:
             try:
                 rows = self._conn.execute("SELECT hash, entry_json FROM ccr_entries").fetchall()
             except sqlite3.DatabaseError as e:
-                self._reset_corrupt_db(e)
+                self._handle_db_error(e, "op")
                 return []
         out: list[tuple[str, CompressionEntry]] = []
         for hash_key, raw in rows:
@@ -222,7 +259,7 @@ class SQLiteBackend:
             try:
                 count_row = self._conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()
             except sqlite3.DatabaseError as e:
-                self._reset_corrupt_db(e)
+                self._handle_db_error(e, "op")
                 count_row = (0,)
         try:
             bytes_used = self._path.stat().st_size
