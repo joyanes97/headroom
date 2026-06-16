@@ -25,7 +25,9 @@ class ConversationScanner(ABC):
         ...
 
     @abstractmethod
-    def scan_project(self, project: ProjectInfo, max_workers: int = 1) -> list[SessionData]:
+    def scan_project(
+        self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True
+    ) -> list[SessionData]:
         """Scan all sessions for a project, returning normalized tool calls."""
         ...
 
@@ -52,7 +54,12 @@ class LearnPlugin(ABC):
                 return Path("~/.myagent/sessions").expanduser().exists()
 
             def discover_projects(self) -> list[ProjectInfo]: ...
-            def scan_project(self, project: ProjectInfo) -> list[SessionData]: ...
+            def scan_project(
+                self,
+                project: ProjectInfo,
+                max_workers: int = 1,
+                include_subagents: bool = True,
+            ) -> list[SessionData]: ...
 
             def create_writer(self) -> ContextWriter:
                 from headroom.learn.writer import GeminiWriter
