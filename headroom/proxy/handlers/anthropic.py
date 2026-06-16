@@ -1252,7 +1252,12 @@ class AnthropicHandlerMixin:
                     maturation_mgr = prefix_tracker.read_maturation_manager
                     if maturation_mgr is None:
                         maturation_mgr = ReadMaturationManager(
-                            ReadMaturationConfig(enabled=True),
+                            ReadMaturationConfig(
+                                enabled=True,
+                                quiesce_turns=self.config.read_maturation_quiesce_turns,
+                                max_hold_turns=self.config.read_maturation_max_hold_turns,
+                                min_size_bytes=self.config.read_maturation_min_size_bytes,
+                            ),
                             compression_store=get_compression_store(),
                         )
                         prefix_tracker.read_maturation_manager = maturation_mgr

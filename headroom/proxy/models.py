@@ -181,6 +181,13 @@ class ProxyConfig:
     # Experimental — default off. CLI: --read-maturation;
     # env: HEADROOM_READ_MATURATION=1
     read_maturation: bool = False
+    # Read-maturation tuning (only meaningful when read_maturation=True).
+    # Defaults mirror ReadMaturationConfig. CLI: --read-maturation-quiesce-turns,
+    # --read-maturation-max-hold-turns, --read-maturation-min-size-bytes;
+    # env: HEADROOM_READ_MATURATION_QUIESCE_TURNS / _MAX_HOLD_TURNS / _MIN_SIZE_BYTES.
+    read_maturation_quiesce_turns: int = 5
+    read_maturation_max_hold_turns: int = 25
+    read_maturation_min_size_bytes: int = 2048
 
     # Deprecated compatibility argument. ContentRouter is always active in
     # the Python proxy; accepting this avoids breaking old config constructors

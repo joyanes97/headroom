@@ -385,6 +385,30 @@ def _selected_context_tool() -> str:
         "file quiesces (env: HEADROOM_READ_MATURATION=1)"
     ),
 )
+@click.option(
+    "--read-maturation-quiesce-turns",
+    type=int,
+    default=5,
+    show_default=True,
+    envvar="HEADROOM_READ_MATURATION_QUIESCE_TURNS",
+    help="Read maturation: mature a held Read once its file is quiet this many assistant turns.",
+)
+@click.option(
+    "--read-maturation-max-hold-turns",
+    type=int,
+    default=25,
+    show_default=True,
+    envvar="HEADROOM_READ_MATURATION_MAX_HOLD_TURNS",
+    help="Read maturation: force-mature a Read held this many turns even if its file stays active.",
+)
+@click.option(
+    "--read-maturation-min-size-bytes",
+    type=int,
+    default=2048,
+    show_default=True,
+    envvar="HEADROOM_READ_MATURATION_MIN_SIZE_BYTES",
+    help="Read maturation: only hold/mature Read outputs at least this many bytes.",
+)
 # Memory System (Multi-Provider Support)
 @click.option(
     "--memory",
@@ -636,6 +660,9 @@ def proxy(
     code_graph: bool,
     no_read_lifecycle: bool,
     read_maturation: bool,
+    read_maturation_quiesce_turns: int,
+    read_maturation_max_hold_turns: int,
+    read_maturation_min_size_bytes: int,
     memory: bool,
     memory_db_path: str,
     memory_storage: str,
@@ -856,6 +883,9 @@ def proxy(
         read_lifecycle=not no_read_lifecycle,
         # Read maturation (Mechanism B): experimental, OFF by default
         read_maturation=read_maturation,
+        read_maturation_quiesce_turns=read_maturation_quiesce_turns,
+        read_maturation_max_hold_turns=read_maturation_max_hold_turns,
+        read_maturation_min_size_bytes=read_maturation_min_size_bytes,
         # Memory System (Multi-Provider with auto-detection)
         # --learn implies --memory (need backend for storing patterns)
         # Stateless mode disables memory (requires SQLite on disk)
