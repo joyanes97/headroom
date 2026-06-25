@@ -73,8 +73,17 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
+from ._ort import ensure_ort_dylib_pinned
 from ._version import __version__  # noqa: F401
-from .compress import (
+
+# Must run before anything can import `headroom._core`: on Windows the
+# Rust core resolves onnxruntime.dll at runtime (ort load-dynamic), and
+# the bare DLL search lands on the Windows ML System32 build, which
+# deadlocks ort session init (Win11 24H2+). Windows-gated, idempotent,
+# ~microseconds. See `headroom/_ort.py` for the full story.
+ensure_ort_dylib_pinned()
+
+from .compress import (  # noqa: E402
     CompressConfig,
     CompressResult,
     compress,
