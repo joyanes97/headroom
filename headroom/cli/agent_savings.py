@@ -76,7 +76,10 @@ def agent_savings(
 ) -> None:
     """Render or verify Codex/Claude/Cursor token-savings settings."""
 
-    savings_profile = get_agent_savings_profile(profile)
+    try:
+        savings_profile = get_agent_savings_profile(profile)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--profile") from None
     if write_smoke_fixture is not None:
         eval_path = _write_smoke_fixture(write_smoke_fixture)
         click.echo(f"Wrote agent-90 smoke fixture to {write_smoke_fixture}")

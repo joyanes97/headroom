@@ -83,12 +83,22 @@ def _get_env_bool_optional(name: str) -> bool | None:
 
 def _get_env_int_optional(name: str) -> int | None:
     val = os.environ.get(name)
-    return int(val) if val is not None and val != "" else None
+    if val is None or val == "":
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        raise click.ClickException(f"{name} must be an integer, got {val!r}") from None
 
 
 def _get_env_float_optional(name: str) -> float | None:
     val = os.environ.get(name)
-    return float(val) if val is not None and val != "" else None
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        raise click.ClickException(f"{name} must be a number, got {val!r}") from None
 
 
 def _selected_context_tool() -> str:
@@ -1230,8 +1240,8 @@ Memory (Multi-Provider):
     context_tool_line = f"  Context Tool: {_selected_context_tool()}"
 
     # Performance tuning section — only shown when at least one tuning var is active.
-    _stable_turn = int(os.environ.get("HEADROOM_COMPRESSION_STABLE_AFTER_TURN", "0"))
-    _stale_turns = int(os.environ.get("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS", "0"))
+    _stable_turn = _get_env_int_optional("HEADROOM_COMPRESSION_STABLE_AFTER_TURN") or 0
+    _stale_turns = _get_env_int_optional("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS") or 0
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
         embedding_server and (embedding_server_socket or f"/tmp/headroom-embed-{port}.sock")
     )
