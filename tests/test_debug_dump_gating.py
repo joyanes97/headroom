@@ -88,9 +88,8 @@ def test_both_handlers_gate_the_dump(module_name):
     module = importlib.import_module(f"headroom.proxy.handlers.{module_name}")
     src = inspect.getsource(module)
     if "debug_400_dir(" in src:
-        assert '_debug_dump_mode(self.config)' in src, (
-            f"{module_name} writes a debug dump but does not gate it on "
-            f"_debug_dump_mode"
+        assert "_debug_dump_mode(self.config)" in src, (
+            f"{module_name} writes a debug dump but does not gate it on _debug_dump_mode"
         )
         assert 'if dump_mode != "off":' in src, (
             f"{module_name} debug dump is not guarded by an off-by-default check"
