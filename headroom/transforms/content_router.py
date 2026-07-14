@@ -2379,7 +2379,8 @@ class ContentRouter(Transform):
         # background (ensure_background_load) instead of blocking this request
         # thread on a 274MB download that races the compression timeout and
         # fails open. Until it is cached, route around the deep path.
-        if self.config.enable_kompress:
+        # skip_kompress (cold-start fast pass) takes the identical fallback.
+        if self.config.enable_kompress and not getattr(self, "_runtime_skip_kompress", False):
             compressor = self._get_kompress()
             if compressor:
                 if not compressor.is_ready():
@@ -3254,6 +3255,11 @@ class ContentRouter(Transform):
         self._runtime_force_kompress: bool = bool(
             kwargs.get("force_kompress", self.config.force_kompress_all)
         )
+        # skip_kompress: run everything EXCEPT the Kompress ML stage this
+        # call. Used by the cold-start fast pass so the request-path pass
+        # stays sub-second; units routed to Kompress take the same fallback
+        # they take when the model isn't ready. Wins over force_kompress.
+        self._runtime_skip_kompress: bool = bool(kwargs.get("skip_kompress", False))
         self._runtime_kompress_model: str | None = kwargs.get("kompress_model")
         # F2.2: capture the per-request CompressionPolicy so
         # ``_record_to_toin`` can gate TOIN writes on
