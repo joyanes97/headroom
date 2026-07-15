@@ -519,4 +519,10 @@ def parse_tool_call(
     if not all(c in "0123456789abcdef" for c in hash_key.lower()):
         return None
 
-    return hash_key
+    # Normalise to lowercase. The compression store always keys entries by a
+    # lowercase hash (sha256 hexdigest, and `explicit_hash.lower()` on store),
+    # and `retrieve` / `get_entry_status` look up the key verbatim. The hex
+    # validation above is already case-insensitive, so a model that echoes the
+    # marker hash uppercase passed validation but then missed the store lookup,
+    # failing an otherwise-valid retrieval. Return the canonical lowercase form.
+    return hash_key.lower()

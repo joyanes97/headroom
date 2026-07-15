@@ -310,6 +310,19 @@ class TestParseToolCall:
 
         assert hash_key == "def456abc123def456abc123"
 
+    def test_parse_normalises_uppercase_hash_to_lowercase(self):
+        """An uppercase hash echoed by the model must be lowercased so it
+        matches the store (which keys entries by a lowercase hash)."""
+        tool_call = {
+            "id": "toolu_123",
+            "name": CCR_TOOL_NAME,
+            "input": {"hash": "ABC123DEF456ABC123DEF456"},
+        }
+
+        hash_key = parse_tool_call(tool_call, "anthropic")
+
+        assert hash_key == "abc123def456abc123def456"
+
     def test_parse_non_ccr_tool(self):
         """Returns None for non-CCR tool calls."""
         tool_call = {
@@ -410,7 +423,7 @@ class TestHashSecurityValidation:
 
         hash_key = parse_tool_call(tool_call, "anthropic")
         # Note: validation accepts uppercase since we use .lower() for hex check
-        assert hash_key == "ABC123DEF456ABC123DEF456"
+        assert hash_key == "abc123def456abc123def456"
 
 
 class TestSmartCrusherCcrMarkers:
