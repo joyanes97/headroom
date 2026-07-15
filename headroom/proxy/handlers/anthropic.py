@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
@@ -1934,6 +1935,16 @@ class AnthropicHandlerMixin:
                             store = get_compression_store()
                             entry = store.get_metadata(hash_key)
                             if entry:
+                                if looks_like_claude_code_compact_summary(
+                                    entry.get("query_context"),
+                                    entry.get("compressed_content"),
+                                    entry.get("original_content_preview"),
+                                ):
+                                    logger.info(
+                                        f"[{request_id}] CCR: skipping proactive "
+                                        f"tracking for Claude Code compact summary {hash_key}"
+                                    )
+                                    continue
                                 self.ccr_context_tracker.track_compression(
                                     hash_key=hash_key,
                                     turn_number=self._turn_counter,
