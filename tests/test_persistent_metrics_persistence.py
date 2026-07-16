@@ -74,7 +74,9 @@ def test_lifetime_response_reports_stateless_mode_without_writing(tmp_path):
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(path=str(path), stateless=True, save_flush_every=1)
 
-    tracker.record_lifetime_request(provider="openai", stack="codex", model="gpt-test", input_tokens=3)
+    tracker.record_lifetime_request(
+        provider="openai", stack="codex", model="gpt-test", input_tokens=3
+    )
 
     response = tracker.lifetime_response()
     assert response["persistence"] == {

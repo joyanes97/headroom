@@ -2064,9 +2064,7 @@ def _request_is_loopback(request: Request) -> bool:
 
 def _request_can_view_dashboard_metadata(
     request: Request,
-    trusted_dashboard_client_cidrs: tuple[
-        ipaddress.IPv4Network | ipaddress.IPv6Network, ...
-    ],
+    trusted_dashboard_client_cidrs: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
 ) -> bool:
     """Authorize sensitive ``/stats`` metadata without widening admin access."""
     if _request_is_loopback(request):
@@ -2081,6 +2079,8 @@ def _request_can_view_dashboard_metadata(
         return False
     if not is_ip_literal_host_header(host_header):
         return False
+    # is_ip_literal_host_header() rejects a missing Host, so host_header is a str here.
+    assert host_header is not None
 
     # CIDR authorization makes this endpoint usable by a remote dashboard, but
     # it must not let an unrelated site read sensitive metadata through a
@@ -2096,9 +2096,7 @@ def _request_can_view_dashboard_metadata(
     )
 
 
-def _request_has_same_origin_or_no_provenance(
-    request: Request, host_header: str
-) -> bool:
+def _request_has_same_origin_or_no_provenance(request: Request, host_header: str) -> bool:
     """Accept no browser provenance, otherwise require same-origin headers."""
 
     from headroom.proxy.forwarded_headers import trusted_forwarded_headers

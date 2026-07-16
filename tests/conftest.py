@@ -29,6 +29,7 @@ def _scrub_developer_headroom_env(monkeypatch):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
 
+
 # =============================================================================
 # Global test hooks
 # =============================================================================

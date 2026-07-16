@@ -1107,9 +1107,7 @@ def proxy(
     if _anyllm_source is click.core.ParameterSource.COMMANDLINE:
         effective_anyllm_provider = anyllm_provider
     else:
-        effective_anyllm_provider = (
-            os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
-        )
+        effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
 
     # Resolve mode: CLI flag > env var > default. Default is CACHE (Headroom's
     # coding posture): delta-only compression at ~0 prefix-cache busts.

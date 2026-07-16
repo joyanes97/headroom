@@ -581,9 +581,7 @@ class SavingsTracker:
         self._persistence_error: str | None = None
         self._needs_schema_save = False
         self._state = self._load_state()
-        self._persistent_metrics = PersistentMetricsState(
-            self._state.pop("lifetime_metrics", None)
-        )
+        self._persistent_metrics = PersistentMetricsState(self._state.pop("lifetime_metrics", None))
 
     @property
     def storage_path(self) -> str:
@@ -859,7 +857,9 @@ class SavingsTracker:
             "compression_savings_usd",
             _estimate_compression_savings_usd(model, _coerce_int(metrics.get("tokens_saved"))),
         )
-        metrics.setdefault("cache_savings_usd", _estimate_cache_savings_usd(model, cache_read_tokens))
+        metrics.setdefault(
+            "cache_savings_usd", _estimate_cache_savings_usd(model, cache_read_tokens)
+        )
         with self._lock:
             self._persistent_metrics.record_request(**metrics)
             if persist:
@@ -871,7 +871,9 @@ class SavingsTracker:
         with self._lock:
             self._persistent_metrics.record_stack(stack)
 
-    def record_lifetime_failed(self, *, provider: str | None = None, model: str | None = None) -> None:
+    def record_lifetime_failed(
+        self, *, provider: str | None = None, model: str | None = None
+    ) -> None:
         """Record a failed proxy request without changing legacy history."""
 
         with self._lock:
@@ -1004,6 +1006,7 @@ class SavingsTracker:
             )
             result[model] = view
         return result
+
     def lifetime_response(self) -> dict[str, Any]:
         """Return the durable aggregate used only by ``/stats-lifetime``."""
 
@@ -1309,8 +1312,7 @@ class SavingsTracker:
                 "other": {
                     "requests": legacy["requests"],
                     "input_tokens": legacy["total_input_tokens"],
-                    "attempted_input_tokens": legacy["total_input_tokens"]
-                    + legacy["tokens_saved"],
+                    "attempted_input_tokens": legacy["total_input_tokens"] + legacy["tokens_saved"],
                     "tokens_saved": legacy["tokens_saved"],
                     "last_activity_at": last_activity_at,
                 },
