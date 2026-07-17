@@ -2741,14 +2741,9 @@
 <td>Daily budget limit in USD</td>
 </tr>
 <tr>
-<td><code>--code-aware</code></td>
-<td>true</td>
-<td>Enable AST-based code compression (env: HEADROOM_CODE_AWARE_ENABLED)</td>
-</tr>
-<tr>
-<td><code>--no-code-aware</code></td>
-<td>false</td>
-<td>Disable code-aware compression</td>
+<td><code>--code-aware</code> / <code>--no-code-aware</code></td>
+<td>disabled</td>
+<td>Enable or disable AST-based code compression. Requires <code>headroom-ai[code]</code> (env: HEADROOM_CODE_AWARE_ENABLED=1 to enable)</td>
 </tr>
 <tr>
 <td><code>--anthropic-api-url</code></td>
@@ -2759,6 +2754,16 @@
 <td><code>--openai-api-url</code></td>
 <td><code>https://api.openai.com</code></td>
 <td>Custom OpenAI API URL endpoint</td>
+</tr>
+<tr>
+<td><code>--anthropic-extra-headers</code></td>
+<td>unset</td>
+<td>JSON object of extra headers merged into (and overriding) forwarded Anthropic requests, e.g. <code>'{"Api-Key": "..."}'</code></td>
+</tr>
+<tr>
+<td><code>--openai-extra-headers</code></td>
+<td>unset</td>
+<td>JSON object of extra headers merged into (and overriding) forwarded OpenAI requests</td>
 </tr>
 </tbody>
 </table>
@@ -2790,12 +2795,8 @@
 </thead>
 <tbody>
 <tr>
-<td><code>--no-ccr-inject-tool</code></td>
-<td>Do not inject the <code>headroom_retrieve</code> tool into the LLM's available tools</td>
-</tr>
-<tr>
-<td><code>--no-ccr-marker</code></td>
-<td>Do not add retrieval markers to compressed output</td>
+<td><code>--no-ccr</code></td>
+<td>Disable CCR entirely — no retrieval markers in compressed output and no injected <code>headroom_retrieve</code> tool (lossy, no recovery path)</td>
 </tr>
 <tr>
 <td><code>--no-ccr-proactive-expansion</code></td>
